@@ -1,4 +1,4 @@
-# PAC2: Anàlisi Adult Income Dataset
+# Pràctica 2: Anàlisi Adult Income Dataset
 
 ## 1. Integrants del grup  
 Víctor Olivera Begue  
@@ -6,7 +6,7 @@ Guillem Romeu Graells
 
 ## 2. Arxius del repositori  
 Aquest repositori conté els fitxers i carpetes següents:
-
+```
 PAC2_AdultIncome/
 ├── dades/
 │   ├── adult.csv                # Dataset original (UCI)
@@ -17,7 +17,7 @@ PAC2_AdultIncome/
 │   └── PR2_final.pdf            # Informe knit a PDF
 ├── README.md                    # Aquest document
 └── LICENSE                      # Llicència del contingut
-
+```
 ## 3. Ús del codi  
 Per executar el codi de la pràctica:
 
