@@ -1,0 +1,558 @@
+---
+title: 'Tipologia i cicle de vida de les dades - Pràctica 2 - Neteja i modelatge de dades'
+author: "Víctor Olivera Begue, Guillem Romeu Graells"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+    toc_depth: 2
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+# Carregar llibreries i dades
+
+```{r setup, message=FALSE, warning=FALSE}
+# Carreguem les llibreries principals
+library(tidyverse)    # manipulació
+library(naniar)       # visual missings
+library(caret)        # partició i nearZeroVar
+library(VIM)          # kNN imputació
+library(randomForest) # random forest
+library(cluster)      # dist, hclust
+library(factoextra)   # fviz_cluster
+library(rstatix)      # tests estadístics
+library(stats)        # chisq.test
+set.seed(123)
+
+# Llegim el CSV original, indicant que "?" sigui NA
+adult <- read_csv("adult.csv", na = "?",   skip = 1,
+                  col_names = c("age","workclass","fnlwgt","education","educational_num",
+                                "marital_status","occupation","relationship","race","sex",
+                                "capital_gain","capital_loss","hours_per_week","native_country",
+                                "income"))
+```
+
+# Descripció del dataset
+
+Tot i que a la Pràctica 1 vam crear un dataset propi mitjançant web scraping, en aquesta pràctica hem optat per treballar amb un nou conjunt de dades: el *Adult Income Dataset* del UCI Machine Learning Repository. Aquesta decisió es justifica perquè el dataset anterior no complia les condicions requerides per aquesta pràctica, ja que:
+
+- No contenia una variable objectiu binària adequada.
+- No hi havia prou volum ni varietat de dades categòriques i numèriques.
+- No era suficientment ric en valors perduts ni outliers per aplicar tècniques de neteja avançades.
+
+Per això, hem decidit utilitzar un dataset públic i ben establert que ens permet aplicar totes les fases del cicle de vida de les dades amb profunditat i justificació tècnica.
+
+El dataset **Adult Income** (“Census Income”) de l’UCI és un dels referents clàssics en problemes de classificació binària, ja que permet predir si el salari anual d’un individu supera els 50 000 \$ basant-se en característiques sociodemogràfiques i laborals obtingudes del cens de 1994. Aquesta relació entre atributs personals (com edat, sexe, educació) i l’ingrés serveix com a punt de partida per a models de decisions en recursos humans, sistemes de crèdit i polítiques públiques de redistribució, a més de ser àmpliament utilitzat en la recerca per validar noves tècniques de machine learning i d’anàlisi de discriminació salarial.
+
+El conjunt consta de **48 842 instàncies** i **14 variables** originals més la variable objectiu (>50K / ≤50K), i presenta tant **atributs numèrics** (p. ex., *age*, *fnlwgt*, *capital-gain*, *hours-per-week*) com **categòrics** (p. ex., *workclass*, *education*, *marital-status*, *occupation*, *native-country*) A més, inclou valors mancants en algunes categories (p. ex., *workclass*, *occupation*), fet que requereix tècniques d’imputació i garanteix pràctica en la gestió de dades reals.
+
+Disposar de variables heterogènies i reals permet desenvolupar models predictius robustos (com regressió logística, arbres de decisió o gradient boosting) i entendre la influència relativa de cada factor en la probabilitat de guanyar més de 50 000 \$/any. Per exemple, l’educació i les hores setmanals solen ser predictors forts, mentre que variables demogràfiques com el gènere o la nacionalitat ajuden a detectar possibles biaixos i dissenyar polítiques més equitatives. Aquestes capacitats converteixen l’Adult Income en un exercici ideal per a l’aplicació de totes les etapes: neteja, exploració, modelatge i interpretació de resultats.
+
+
+# Integració i selecció inicial
+
+### Definir variables numeriques i categoriques
+
+```{r}
+# Definim manualment quines volem numèriques i quines factors:
+
+num_vars <- c(
+  "age",
+  "fnlwgt",
+  "educational_num",
+  "capital_gain",
+  "capital_loss",
+  "hours_per_week"
+)
+
+fac_vars <- setdiff(
+  names(adult),
+  num_vars
+)
+
+# Excloem d’entre els factor també la columna income_bin si ja existeix,
+# i assegurem income com a factor abans de crear income_bin:
+fac_vars <- setdiff(fac_vars, "income_bin")
+
+# Ara fem la conversió:
+adult <- adult %>%
+  # convertir a numèric les que volem numèriques
+  mutate(across(all_of(num_vars), as.numeric)) %>%
+  # convertir a factor la resta de característiques
+  mutate(across(all_of(fac_vars), as.factor)) %>%
+  # crear income_bin basat en income
+  mutate(
+    income     = as.factor(income),
+    income_bin = factor(if_else(income == ">50K", "high", "low"),
+                        levels = c("low","high"))
+  )
+
+# Verifiquem tipus
+glimpse(adult)
+
+```
+
+## Resum estadístic i detecció de missings
+
+```{r }
+# Resum descriptiu
+summary(adult)
+
+# Comptar missings
+adult %>%
+  summarise_all(~ sum(is.na(.))) %>%
+  pivot_longer(everything(), names_to="var", values_to="n_miss")
+
+# Proporció de missings
+adult %>%
+  summarise_all(~ mean(is.na(.))) %>%
+  pivot_longer(everything(), names_to="var", values_to="pct_miss")
+
+# Mapa visual de missings
+vis_miss(adult) + 
+  labs(title="Patró de missings al dataset")
+```
+
+## Creació de variables noves
+
+```{r}
+# Discretització d'edat
+adult2 <- adult %>%
+  # net_capital = guanys - pèrdues
+  mutate(net_capital = capital_gain - capital_loss) %>%
+  mutate(age_group = cut(age,
+                         breaks=c(15,20,30,40,50,60,70,80,90,Inf),
+                         labels=c("15-19","20-29","30-39","40-49","50-59",
+                                  "60-69","70-79","80-89","90+"),
+                         right=FALSE))
+```
+
+## Variables irrelevants i cardinalitat
+
+```{r var-selection}
+# Variables amb gairebé zero variància
+nzv <- nearZeroVar(adult2, saveMetrics=TRUE)
+rownames(nzv)[nzv$nzv]
+
+# Agrupar països amb <1% en "Other"
+table(adult2$native_country)
+adult3 <- adult2 %>%
+  mutate(native_country = fct_lump(native_country, prop=0.01, other_level="Other"))
+
+table(adult3$native_country)
+
+```
+
+## Distribució de classes i sampling
+
+```{r}
+# Distribució original de sex
+adult3 %>%
+  count(sex) %>%
+  mutate(pct = n/sum(n)*100)
+
+# Oversampling amb ROSE per equilibrar 50/50
+library(ROSE)
+adult4 <- ovun.sample(sex ~ ., data=adult3, method="both", p=0.5, N=nrow(adult3))$data
+
+# Verificar nova distribució
+adult4 %>%
+  count(sex) %>%
+  mutate(pct = n/sum(n)*100)
+```
+Fem un oversample per igualar els casos de homes i dones 
+
+# Neteja de dades
+
+## Imputació kNN en workclass i occupation
+
+```{r}
+table(adult4$occupation)
+adult_imp <- kNN(adult4,
+                 variable=c("workclass","occupation"),
+                 k=5, imp_var=FALSE)
+# Perque no despareixin els outliers
+adult_fac <- adult_imp
+```
+## Detecció d’outliers
+
+### Boxplots univariants
+
+```{r}
+num_vars <- adult_fac %>% select(where(is.numeric)) %>% names()
+for(v in num_vars){
+  v_esc <- paste0("`",v,"`")
+  p <- ggplot(adult_fac, aes_string(x="factor(1)", y=v_esc)) +
+    geom_boxplot(outlier.colour="red", outlier.alpha=0.4) +
+    labs(title=paste("Boxplot de",v), x=NULL, y=v) +
+    theme_minimal() +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank())
+  print(p)
+}
+```
+
+### Cook’s distance en model logístic
+
+```{r}
+# 1) Recalculem la distància de Cook
+adult_fac <- adult_fac %>%
+  mutate(income_bin = if_else(income == ">50K", 1, 0))
+
+glm_mod2 <- glm(income_bin ~ age + hours_per_week + educational_num,
+                data   = adult_fac,
+                family = binomial)
+
+cooksd <- cooks.distance(glm_mod2)
+
+# 2) Definim el llindar d’influència
+n <- nrow(adult_fac)
+p <- length(coef(glm_mod2))
+threshold <- 4 / (n - p - 1)
+
+# 3) Identifiquem i eliminem les observacions per sobre del llindar
+influential_obs <- which(cooksd > threshold)
+length(influential_obs)  # nombre de punts crítics
+
+adult_noinflu <- adult_fac[-influential_obs, ]
+
+# 4) Replot de la distància de Cook amb el llindar marcat
+plot(cooksd, pch="*", cex=0.5,
+     main = "Cook's distance (logístic) amb llindar")
+abline(h = threshold, col = "red", lwd = 2)
+text(x = influential_obs, y = cooksd[influential_obs],
+     labels = influential_obs, pos = 3, cex = 0.7)
+
+# 5) Veiem com han quedat les dades sense els outliers influents
+cat("Observacions eliminades:", length(influential_obs), "\n")
+cat("Nova mida de dataset:", nrow(adult_noinflu), "\n")
+
+```
+
+# Anàlisi de les dades
+
+```{r setup2, message=FALSE, warning=FALSE}
+# Carreguem llibreries i configurem semilla
+library(tidyverse)
+library(caret)         # createDataPartition, confusionMatrix
+library(randomForest)  # random forest (no supervisat opcional)
+library(pROC)          # roc, auc
+library(cluster)       # dist, silhouette
+library(factoextra)    # fviz_cluster
+library(rstatix)       # tests estadístics
+library(stats)         # chisq.test
+set.seed(123)
+```
+
+## Preparació de train/test
+```{r}
+# Partim de `adult_noinflu` amb income_bin ja en factor("low","high")
+# Exemple: adult_noinflu <- adult_noinflu %>% mutate(income_bin = factor(if_else(income==">50K","high","low"), levels=c("low","high")))
+
+idx   <- createDataPartition(adult_noinflu$income_bin, p = 0.7, list = FALSE)
+train <- adult_noinflu[idx, ]
+test  <- adult_noinflu[-idx, ]
+
+```
+
+## Ajust i predicció amb regressió logística
+```{r}
+# Ajust sobre TRAIN
+glm_mod <- glm(
+  income_bin ~ age + hours_per_week + educational_num + net_capital,
+  data   = train,
+  family = binomial
+)
+
+# Prediccions sobre TEST
+# Ajustat perquè pred_test és character i no té els mateixos nivells que test$income_bin.
+probs_test <- predict(glm_mod, test, type = "response")
+pred_test <- factor(
+  if_else(probs_test > 0.5, "high", "low"),
+  levels = c("low", "high")
+)
+test$income_bin <- factor(test$income_bin, levels = c("low", "high"))
+
+# Matriu de confusió i Accuracy
+conf_glm <- confusionMatrix(pred_test, test$income_bin)
+print(conf_glm$table)
+cat("Accuracy (glm):", round(conf_glm$overall["Accuracy"], 3), "\n")
+
+# AUC
+# Comprovem si el test conté les dues classes
+if (length(unique(test$income_bin)) == 2) {
+  roc_glm <- roc(response = test$income_bin,
+                 predictor = probs_test,
+                 levels = c("low", "high"))
+  cat("AUC (glm):", round(auc(roc_glm), 3), "\n")
+} else {
+  cat("No es pot calcular l'AUC: només hi ha una classe a test$income_bin\n")
+}
+
+```
+## Model no supervisat amb predicció i mètriques: PAM + mapatge a classes
+
+```{r unsup-pam-with-pred, message=FALSE, warning=FALSE}
+library(cluster)
+library(factoextra)
+library(caret)
+
+# 5.3.1 Normalització Min–Max de dues variables en TRAIN i TEST
+norm_vars <- c("age", "hours_per_week")
+
+train_norm <- train %>%
+  select(all_of(norm_vars)) %>%
+  drop_na() %>%
+  mutate(across(everything(),
+                ~ (. - min(.)) / (max(.) - min(.))))
+
+test_norm <- test %>%
+  select(all_of(norm_vars)) %>%
+  drop_na() %>%
+  mutate(across(everything(),
+                ~ (. - min(train_norm[[cur_column()]])) /
+                  (max(train_norm[[cur_column()]]) - min(train_norm[[cur_column()]]))))
+
+# 5.3.2 Ajustem PAM amb k = 2 sobre TRAIN
+pam_mod <- pam(train_norm, k = 2)
+
+# 5.3.3 Mapatge de clusters a classes reals en TRAIN
+train_clusters <- pam_mod$clustering
+cluster_to_class <- tapply(train$income_bin, train_clusters,
+                           function(x) names(sort(table(x), decreasing=TRUE))[1])
+# Ara cluster_to_class[["1"]] és la classe majoritària del cluster 1, etc.
+
+# 5.3.4 Assignació de TEST a clústers (distància al medoid més proper)
+medoids <- pam_mod$medoids
+dists_test <- sapply(1:2, function(k) {
+  rowSums((as.matrix(test_norm) - medoids[k, ])^2)
+})
+test_clusters <- apply(dists_test, 1, which.min)
+
+# 5.3.5 Predicció de classes a TEST a partir del mapatge
+pred_pam_class <- factor(cluster_to_class[test_clusters], levels = c("low","high"))
+
+# 5.3.6 Mètriques d’ajust: Matriu de confusió i accuracy
+conf_pam <- confusionMatrix(pred_pam_class, test$income_bin)
+print(conf_pam$table)
+cat("Accuracy (PAM-based):", round(conf_pam$overall["Accuracy"], 3), "\n")
+
+# 5.3.7 Silhouette width mitjana sobre TRAIN
+avg_sil_pam <- pam_mod$silinfo$avg.width
+cat("Silhouette width mitjana (TRAIN):", round(avg_sil_pam, 3), "\n")
+
+# 5.3.8 Visualització del model sobre TRAIN
+fviz_cluster(pam_mod,
+             geom         = "point",
+             ellipse.type = "convex",
+             ggtheme      = theme_minimal()) +
+  labs(title = "PAM (k = 2) sobre TRAIN (age & hours_per_week)")
+``` 
+
+
+**Explicació del flux:**
+
+1. **Normalització**: escales Min–Max per `age` i `hours_per_week` en train i test (usant rang de train per al test).  
+2. **Entrenament PAM**: creem 2 clústers sobre el train.  
+3. **Mapatge a classes**: assignem a cada clúster la classe (`low`/`high`) més freqüent en train.  
+4. **Predicció en test**: calculem la distància quadràtica de cada punt de test als medoids i triem el clúster més proper.  
+5. **Mètriques**: construïm la matriu de confusió comparant classes predites vs reals i calculem accuracy.  
+6. **Silueta**: imprimim la mitjana de l’índex de silueta sobre el train per avaluar qualitat de clustering.  
+7. **Plot**: representem els clústers de train amb el·lipse convexa sobre les dues variables.
+
+
+## Proves d’hipòtesis amb comprovació d’assumpcions
+
+```{r}
+library(rstatix)
+library(stats)
+```
+
+**Nota:** partim del conjunt `train` amb la variable `income_bin` ja transformada a factor amb els nivells `"low"` i `"high"`.
+
+
+## Test A: hours_per_week ~ income_bin
+```{r}
+train <- train[1:4000,] # El test shapiro accepta màxim 5000 dades
+
+# 1) Normalitat per grup
+# Normalitat per grup (limitant a màxim 5000 observacions)
+hours_low  <- train %>% filter(income_bin == "low") %>% pull(hours_per_week)
+hours_high <- train %>% filter(income_bin == "high") %>% pull(hours_per_week)
+
+hours_low  <- hours_low[1:min(5000, length(hours_low))]
+hours_high <- hours_high[1:min(5000, length(hours_high))]
+
+if (length(hours_low) >= 3 && length(hours_high) >= 3) {
+  sh_low  <- shapiro_test(hours_low)
+  sh_high <- shapiro_test(hours_high)
+} else {
+  cat("No es pot aplicar el test de Shapiro: mostra massa petita.\n")
+  sh_low <- sh_high <- NULL
+}
+
+# 2) Homogeneïtat de variàncies
+# Assegurem que income_bin és factor amb almenys dues categories
+train$income_bin <- factor(train$income_bin, levels = c("low", "high"))
+
+if (nlevels(droplevels(train$income_bin)) < 2) {
+  cat("No es pot fer el test de Levene: només hi ha una categoria a income_bin.\n")
+  lev <- NULL
+} else {
+  lev <- levene_test(hours_per_week ~ income_bin, data = train)
+}
+
+
+# 3) Selecció del test
+# Selecció del test (si tenim resultats de Shapiro)
+if (!is.null(sh_low) && !is.null(sh_high) && !is.null(lev) &&
+    sh_low$p.value > 0.05 && sh_high$p.value > 0.05 && lev$p > 0.05)
+ {
+  test_hours <- t_test(hours_per_week ~ income_bin, data = train)
+  cat("Usant t-test perquè es compleixen normalitat i homocedasticitat\n")
+} else {
+# Comprovació de mida abans de fer Wilcoxon
+if (nrow(train %>% drop_na(hours_per_week)) >= 10 &&
+    length(unique(na.omit(train$income_bin))) == 2) {
+  test_hours <- wilcox_test(hours_per_week ~ income_bin, data = train)
+} else {
+  cat("No es pot aplicar el test de Wilcoxon: no hi ha prou dades o classes.\n")
+  test_hours <- NULL
+}
+
+  cat("Usant Wilcoxon perquè no es compleixen els requisits d’un t-test\n")
+}
+
+print(sh_low)
+print(sh_high)
+print(lev)
+if (!is.null(test_hours)) print(test_hours)
+
+```
+El resultat del Wilcoxon comparant `hours_per_week` entre els dos grups (low vs. high) és:
+
+* **W = 1 131 097**, **p < 2 × 10⁻¹⁶** (aprox. 1.49 × 10⁻⁶⁴)
+* **n₁ = 2 822** (low), **n₂ = 1 178** (high)
+
+Com que **p ≪ 0,05**, rebutgem l’hipòtesi nul·la de distribucions iguals de `hours_per_week` entre els qui guanyen ≤ 50K i els que guanyen > 50K. Això vol dir que hi ha una diferència **estadísticament significativa** en nombre d’hores treballades setmanalment:
+
+* Els ingressos més alts s’associen a **més hores treballades** (la mediana del grup “high” és superior a la del grup “low”).
+
+Així, podem concloure que dedicar més hores a la feina es relaciona amb una probabilitat més alta de pertànyer al grup de > 50K.
+
+
+# Representació de distribucions després de la neteja
+
+  Distribució de valors per a variables categòriques
+
+```{r}
+adult_fac %>%
+  select(where(is.factor)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valor") %>%
+  count(variable, valor) %>%
+  group_by(variable) %>%
+  mutate(pct = round(n / sum(n) * 100, 2)) %>%
+  arrange(variable, desc(n)) %>%
+  print(n = 100)
+
+# Estadístiques descriptives de les variables numèriques
+
+adult_fac %>%
+  select(where(is.numeric)) %>%
+  summary()
+```
+# Codi
+
+## Publicació del codi
+
+El codi desenvolupat per realitzar la neteja, transformació i anàlisi del conjunt de dades Adult Income es troba publicat al repositori GitHub següent:
+
+🔗 https://github.com/Guillemromeu/PAC2-TCVD-Victor-Guillem
+
+L’arxiu principal és Pràctica2.Rmd, ubicat dins la carpeta /codi, i conté tot el procés analític documentat: des de la càrrega de dades fins a les conclusions finals.
+
+A més, el repositori inclou els fitxers següents:
+
+README.md: descripció general del projecte, estructura i instruccions d’execució.
+
+LICENSE: llicència del projecte per a ús educatiu.
+
+/dades/adult.csv: dataset original extret del repositori UCI.
+
+/dades/adult_net_final.csv: dataset final, netejat i imputat.
+
+/informe/Memòria Pràctica 2 Víctor Olivera i Guillem Romeu.pdf: informe final generat a partir del codi.
+
+# Vídeo
+
+Hem realitzat un vídeo de presentació titulat “Pràctica 2 - Vídeo explicatiu del projecte”, en el qual es mostren els aspectes més rellevants de la pràctica. L’enregistrament està disponible al següent enllaç:
+
+https://drive.google.com/drive/folders/1uxO3c8djVWcA67RFlMv0UHM9rHlYm2yr
+
+Durant el vídeo, ambdós membres del grup participem activament, presentant:
+
+•	El context i objectiu del projecte, basat en el Adult Income Dataset del UCI.
+
+•	Les fases aplicades sobre el conjunt de dades: neteja, transformació, selecció i imputació.
+
+•	L’aplicació de models supervisats (regressió logística) i no supervisats (PAM).
+
+•	L’ús de proves estadístiques (Wilcoxon) amb comprovació prèvia d’assumpcions.
+
+•	Les conclusions extretes, incloent-hi la interpretació de resultats, limitacions i proposta de millora.
+
+•	Els criteris ètics considerats durant tot el procés, treballant amb dades públiques i anonimitzades.
+
+Per fer la presentació, hem seguit el guió facilitat pel model al punt anterior i hem intentat transmetre tant el valor analític del projecte com el procés tècnic dut a terme.
+
+# Conclusions i propostes de millora
+
+Aquest projecte ha permès aplicar de manera pràctica totes les fases del cicle de vida de les dades sobre un dataset real. El conjunt de dades *Adult Income* ha estat netejat, transformat i analitzat per predir si una persona guanya més de 50.000 $ anuals, a partir de variables socioeconòmiques i demogràfiques.
+
+S’ha tractat amb èxit la presència de valors perduts mitjançant imputació per kNN, s’han unificat nivells amb baixa representació i s’han eliminat observacions influents amb distància de Cook. El dataset net s’ha usat per construir models supervisats (regressió logística) i no supervisats (clustering PAM), així com per realitzar anàlisis estadístiques inferencials amb proves no paramètriques.
+
+## Conclusions clau
+
+- Variables com `educational_num`, `hours_per_week` i `net_capital` són les més predictives per estimar els ingressos.
+- El model de regressió logística ha obtingut una bona precisió (accuracy) i una AUC robusta.
+- El clustering PAM, tot i no tenir accés a la variable objectiu, ha pogut separar els grups amb una silueta mitjana acceptable.
+- El test de Wilcoxon confirma que hi ha diferències significatives en les hores treballades entre persones amb ingressos baixos i alts.
+
+## Limitacions
+
+- El dataset és antic (1994) i pot no reflectir la realitat socioeconòmica actual.
+- La variable `fnlwgt` no ha estat utilitzada; tot i que pot ser rellevant a nivell poblacional, no aportava valor directe al model.
+- Tot i la imputació, algunes variables categòriques poden conservar cert biaix.
+
+## Propostes de millora
+
+- Aplicar tècniques de validació creuada (cross-validation) per avaluar millor el rendiment.
+- Explorar altres models com random forests o XGBoost.
+- Afegir variables derivades del país d’origen i estudiar el seu efecte.
+- Fer una reflexió ètica més profunda sobre el biaix potencial de gènere o origen en els resultats.
+
+# Taula de contribucions
+
+**Contribucions i signatura**
+
+- Investigació prèvia: G.R.G., V.O.B.
+- Redacció de les respostes: G.R.G., V.O.B.
+- Desenvolupament del codi: G.R.G., V.O.B.
+- Participació al vídeo: G.R.G., V.O.B.
+
+> G.R.G. = Guillem Romeu Graells  
+> V.O.B. = Víctor Olivera Begue
+
+
+# Exportació del dataset final net
+
+  Exportem el dataset netejat amb imputació i transformacions finals
+```{r}
+if (interactive()) {
+  write.csv(adult_fac, "adult_net_final.csv", row.names = FALSE)
+}
+
+```
+
