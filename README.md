@@ -40,7 +40,7 @@ El codi:
 - Representa gràficament els resultats
 
 ## 4. Enllaç al vídeo  
-Enllaç a Google Drive: S'HA DE FER I AFAGIR ENCARA
+https://drive.google.com/drive/folders/1uxO3c8djVWcA67RFlMv0UHM9rHlYm2yr
 
 ## 5. Descripció del projecte  
 Aquest projecte correspon a la Pràctica 2 de l’assignatura _Tipologia i cicle de vida de les dades_ del Màster en Ciència de Dades (UOC).  
